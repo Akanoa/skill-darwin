@@ -9,6 +9,15 @@ DARWIN="python3 $HERE/darwin.py"
 WORK="${1:-$(mktemp -d)}/darwin-selftest"
 PASSED=0
 
+# a failed assertion exits early, so tear down from a trap rather than the
+# happy path - otherwise a broken run leaves worktrees and herdr workspaces behind
+cleanup() {
+  local rc=$?
+  [ "$rc" = "0" ] || { [ -d "$WORK" ] && $DARWIN --cwd "$WORK" clean --delete-branches >/dev/null 2>&1; }
+  return $rc
+}
+trap cleanup EXIT
+
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$1"; PASSED=$((PASSED+1)); }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 jget() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(eval(sys.argv[2],{'d':d}))" "$1" "$2"; }
