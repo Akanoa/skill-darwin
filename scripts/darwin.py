@@ -1391,6 +1391,92 @@ def cmd_judge(args):
     print(json.dumps(judgment, indent=2))
 
 
+def cmd_feedback(args):
+    """Render the next round's brief-back from a round's evidence.
+
+    A draft, not a substitute for judgement: an orchestrator that reads the
+    round should edit this before sending it. It exists so an unattended loop
+    still hands the implementer specifics instead of "try again".
+    """
+    ctx = ctx_for(args)
+    rnd = args.round or ctx.state["round"] or 1
+    jud = read_json(ctx.round_dir(rnd) / "judgment.json", default={})
+    rev = read_json(ctx.round_dir(rnd, "reviewer") / "REVIEW.json", default={})
+    ver = read_json(ctx.round_dir(rnd, "implementer") / "verify.orchestrator.json", default={})
+    verdict = jud.get("recorded_verdict") or jud.get("recommendation") or "REVISE"
+
+    out = [f"# Round {rnd}: {verdict}", ""]
+    if verdict == "PASS":
+        out.append("Nothing blocking. This feedback should not have been requested.")
+        text = "\n".join(out) + "\n"
+    else:
+        summary = ver.get("summary", {})
+        out += ["## What the replay found", ""]
+        out.append(f"- {summary.get('killed', 0)} of {summary.get('total', 0)} of your mutants died on replay.")
+        if summary.get("fabricated_kills"):
+            out.append(f"- **Claims that did not reproduce: {summary['fabricated_kills']}.** "
+                       f"These were reported KILLED and survive when replayed. Re-measure with "
+                       f"`darwin mutant run`; never hand-write a `claimed` value.")
+        for g in ver.get("guards", []):
+            out.append(f"- `{g['code']}` ({g['severity']}): {g['detail'].splitlines()[0][:300]}")
+        out.append("")
+
+        survivors = [a for a in (rev.get("adversarial_mutants") or [])
+                     if (a.get("observed") or {}).get("status") == "SURVIVED"]
+        if survivors:
+            out += ["## The reviewer's mutants that your tests do not catch", "",
+                    "Each of these is a defect your suite cannot see. Reproduce one with:",
+                    "",
+                    f"```",
+                    f"cd <your worktree>",
+                    f"git apply {ctx.round_dir(rnd, 'reviewer') / 'mutants'}/<ID>.patch",
+                    f"{ctx.cfg['test']['command']}      # passes - that is the problem",
+                    f"git checkout -- .",
+                    f"```", ""]
+            for a in survivors:
+                out.append(f"- **{a.get('id')}** - {a.get('intent')}")
+                if a.get("significance"):
+                    out.append(f"  - why it matters: {a['significance']}")
+            out += ["", "Write the test that kills each one, then adopt the mutant into your own "
+                        "set and show it dying.", ""]
+
+        weak = [m for m in (rev.get("mutant_findings") or [])
+                if m.get("quality") in ("weak", "trivial")]
+        if weak:
+            out += ["## Mutants the reviewer graded as proving little", ""]
+            for m in weak:
+                out.append(f"- **{m.get('id')}** ({m.get('quality')}): {m.get('note')}")
+            out += ["", "A mutant that also breaks the happy path is killed by tests that existed "
+                        "before your work. Replace these with surgical ones that only the behaviour "
+                        "under test can catch.", ""]
+
+        if rev.get("coverage_gaps"):
+            out += ["## Behaviour with no mutant on it", ""] + \
+                   [f"- {g}" for g in rev["coverage_gaps"]] + [""]
+        if rev.get("test_quality_issues"):
+            out += ["## Test quality", ""] + \
+                   [f"- {t}" for t in rev["test_quality_issues"]] + [""]
+        if rev.get("dishonesty_findings"):
+            out += ["## Reported as dishonesty - answer these directly", ""] + \
+                   [f"- [{f.get('kind')}] {f.get('evidence')}" for f in rev["dishonesty_findings"]] + \
+                   ["", "If you disagree, say so with evidence; if you agree, fix it and say what "
+                        "you changed. Do not ignore it.", ""]
+
+        out += ["## This round", "",
+                "Work in the same worktree - the history is the evidence. Add tests first, as "
+                "before, then re-measure every mutant (old and new) and rebuild the report.",
+                ""]
+        text = "\n".join(out) + "\n"
+
+    target = Path(args.out) if args.out else ctx.round_dir(rnd) / "feedback.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    if args.out or args.quiet:
+        print(str(target))
+    else:
+        sys.stdout.write(text)
+
+
 def cmd_escalate(args):
     ctx = ctx_for(args)
     rnd = args.round or ctx.state["round"] or 1
@@ -1485,7 +1571,20 @@ def cmd_worktree(args):
     if args.action == "add":
         role = args.role
         if role in ctx.state["roles"] and Path(ctx.state["roles"][role]["worktree"]).exists():
-            print(json.dumps(ctx.state["roles"][role], indent=2))
+            info = ctx.state["roles"][role]
+            # a later round means the implementer has moved on; the reviewer must
+            # look at the code it is reviewing, not at last round's snapshot
+            if role == "reviewer" and "implementer" in ctx.state["roles"]:
+                wt = Path(info["worktree"])
+                clean, _ = tree_clean(wt)
+                if not clean:
+                    revert_tree(wt)
+                target = ctx.state["roles"]["implementer"]["branch"]
+                git(["reset", "--hard", target], cwd=wt, check=False)
+                info = {**info, "synced_to": head_commit(wt)}
+                ctx.state["roles"][role] = info
+                ctx.save()
+            print(json.dumps(info, indent=2))
             return
         if args.base:
             base = args.base
@@ -1771,6 +1870,11 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--once", action="store_true"); ui.add_argument("--follow", action="store_true")
     ui.add_argument("--interval", type=int, default=3)
     ui.set_defaults(func=cmd_ui)
+
+    fb = with_run(sub.add_parser("feedback", help="draft the next round's brief-back from this round's evidence"))
+    fb.add_argument("--round", type=int); fb.add_argument("--out")
+    fb.add_argument("--quiet", action="store_true", help="print the path, not the text")
+    fb.set_defaults(func=cmd_feedback)
 
     e = with_run(sub.add_parser("escalate", help="stop the loop and write a human-review request"))
     e.add_argument("--round", type=int); e.add_argument("--reason", required=True)

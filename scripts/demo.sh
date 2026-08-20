@@ -95,52 +95,77 @@ RUN=$(cat .darwin/current)
 # herdr, so without this the loop has no presence in the UI
 $DARWIN ui || true
 
-watch_role() {   # $1 = role, $2 = round
-  local role="$1" round="$2" pid pane
-  $DARWIN spawn --role "$role" --round "$round" > ".darwin/spawn-$role.json" 2>&1 &
+watch_role() {   # $1 = role, $2 = round, $3 = optional feedback file
+  local role="$1" round="$2" feedback="${3:-}" pid pane args
+  args=(--role "$role" --round "$round")
+  [ -n "$feedback" ] && args+=(--feedback-file "$feedback")
+  $DARWIN spawn "${args[@]}" > ".darwin/spawn-$role-r$round.json" 2>&1 &
   pid=$!
   pane=$(python3 -c "import json;print(json.load(open('.darwin/runs/$RUN/run.json'))['roles']['$role'].get('pane_id',''))")
-  note "watching pane $pane - attach with: herdr agent attach darwin-$role"
+  note "$role is live in pane $pane - attach with: herdr agent attach darwin-$role"
   while kill -0 "$pid" 2>/dev/null; do
-    sleep 20
+    sleep 30
     herdr agent list 2>/dev/null | python3 -c "
 import json,sys
 try: agents = json.load(sys.stdin)['result']['agents']
 except Exception: sys.exit()
 for a in agents:
-    print('   %-22s %-8s %s' % (a.get('name') or a.get('label'),
-                                a.get('agent_status') or '?',
-                                (a.get('terminal_title_stripped') or a.get('message') or '')[:60]))
+    if not (a.get('name') or '').startswith('darwin-'): continue
+    print('   %-22s %-8s %s' % (a.get('name'), a.get('agent_status') or '?',
+                                (a.get('terminal_title_stripped') or '')[:56]))
 " || true
   done
   wait "$pid" || true
-  cat ".darwin/spawn-$role.json"
+  cat ".darwin/spawn-$role-r$round.json"
 }
 
-hr "implementer (claude/$IMPL_MODEL) - red, green, mutate, report"
-$DARWIN worktree add --role implementer
-watch_role implementer 1
+MAX=$(python3 -c "import json;print(json.load(open('darwin.config.json'))['max_rounds'])")
+FEEDBACK=""
+VERDICT=""
 
-hr "orchestrator replays every mutant itself"
-$DARWIN verify --role implementer --round 1 --verifier orchestrator
+for ROUND in $(seq 1 "$MAX"); do
+  hr "round $ROUND / $MAX - orchestrator dispatches the task to the implementer"
+  [ -n "$FEEDBACK" ] && note "carrying feedback from round $((ROUND - 1)): $FEEDBACK"
+  $DARWIN worktree add --role implementer >/dev/null 2>&1 || true
+  watch_role implementer "$ROUND" "$FEEDBACK"
 
-hr "reviewer (claude/$REVIEW_MODEL) - replay, grade, attack"
-$DARWIN worktree add --role reviewer
-watch_role reviewer 1
+  hr "round $ROUND - orchestrator collects the report and replays it itself"
+  $DARWIN verify --role implementer --round "$ROUND" --verifier orchestrator
 
-hr "judgment"
-$DARWIN judge --round 1
+  hr "round $ROUND - orchestrator summons the reviewer"
+  $DARWIN worktree add --role reviewer >/dev/null 2>&1 || true
+  watch_role reviewer "$ROUND"
 
-hr "herdr state"
-herdr workspace list 2>/dev/null | python3 -c "
-import json,sys
-for w in json.load(sys.stdin)['result'].get('workspaces', []):
-    print('   %-4s %-22s panes=%s status=%s' % (w['workspace_id'], w.get('label'), w.get('pane_count'), w.get('agent_status')))
-" || true
+  hr "round $ROUND - verdict"
+  REC=$($DARWIN judge --round "$ROUND" | python3 -c "import json,sys;print(json.load(sys.stdin)['recommendation'])")
+  note "computed recommendation: $REC"
+  $DARWIN judge --round "$ROUND" --record "$REC" \
+    --reason "unattended demo: recording the computed recommendation" > "judgment-r$ROUND.json"
+  python3 -c "
+import json
+d = json.load(open('judgment-r$ROUND.json'))
+print('   verdict:', d['recommendation'])
+for b in d['blocking']: print('   blocking -', b[:150])
+for n in d['notes'][:4]: print('   note     -', n[:150])
+"
+  VERDICT="$REC"
+  [ "$REC" = "PASS" ] && break
+  if [ "$REC" = "ESCALATE" ]; then
+    $DARWIN escalate --round "$ROUND" --reason "the loop stopped converging - see judgment.json"
+    break
+  fi
+
+  hr "round $ROUND - orchestrator writes the brief-back for round $((ROUND + 1))"
+  FEEDBACK="$PWD/.darwin/runs/$RUN/rounds/r$ROUND/feedback.md"
+  $DARWIN feedback --round "$ROUND" --out "$FEEDBACK" >/dev/null
+  sed -n '1,40p' "$FEEDBACK"
+done
+
+hr "final state"
+$DARWIN watch --once
+[ "$VERDICT" = "PASS" ] && $DARWIN land --strategy patch || true
 
 hr "what to look at"
 note "evidence:   $WORK/.darwin/runs/$RUN/"
-note "report:     .../rounds/r1/implementer/MUTATION-REPORT.json"
-note "replay:     .../rounds/r1/implementer/verify.orchestrator.json"
-note "review:     .../rounds/r1/reviewer/REVIEW.json"
-note "teardown:   $DARWIN --cwd $WORK clean --delete-branches"
+note "board:      $DARWIN watch"
+note "teardown:   $DARWIN clean --delete-branches"
