@@ -172,11 +172,19 @@ that reproduces it, the mutants graded weak and why, the coverage gaps, anything
 reported as dishonesty — and the next round runs in the *same* worktree, because
 the history is part of the evidence.
 
-Rounds are bounded. `darwin escalate` stops the loop and writes `ESCALATION.md`
-when claims were fabricated twice, when `max_rounds` is reached with findings
-still blocking, when two rounds' verifications disagree (a flaky suite cannot be
-reviewed into reliability), or when the two agents turn out to disagree about what
-correct behaviour even is. **Escalation is a success mode.** The failure mode is
+How long the loop runs is a judgement, not a counter. `judge` compares every
+round against the ones before it and puts a shape on the sequence — `converging`
+when the previous round's findings are closed and the reviewer has moved to new
+ground, `partial` when some were ignored, `recurring` when the same findings come
+back untouched, `flat` when a round changed nothing, `converged` when nothing
+in-task survives. Set `max_rounds: null` and those shapes decide, bounded by a
+hard cap so a pathological run still ends.
+
+`darwin escalate` stops the loop and writes `ESCALATION.md` when findings recur
+with nothing closed, when a run stalls for two rounds, when claims were fabricated
+twice, when two rounds' verifications disagree (a flaky suite cannot be reviewed
+into reliability), or when the two agents turn out to disagree about what correct
+behaviour even is. **Escalation is a success mode.** The failure mode is
 burning rounds on evidence that was never going to converge.
 
 ### Why the isolation matters

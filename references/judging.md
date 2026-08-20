@@ -58,6 +58,30 @@ implementer worktree. The history is part of the evidence; do not start clean.
 
 **ESCALATE** — stop the loop and write `ESCALATION.md`.
 
+## Reading the trend, not just the round
+
+`judge` also looks back over every round of the run and puts a shape on the
+sequence, in `judgment.json` under `trend`. One round tells you whether the work
+is good; the sequence tells you whether the loop is worth continuing.
+
+| shape | what it means | what to do |
+|---|---|---|
+| `converged` | nothing in-task survives, no guards, no fabrications | **PASS**. Any leftover `beyond-task` survivors are feature requests to hand back, not defects |
+| `converging` | the previous round's findings are closed and the reviewer has moved to new ground | **REVISE**, keep going - this is the loop working |
+| `partial` | some findings closed, some still open | **REVISE**, and say in the feedback which ones were ignored |
+| `recurring` | the same findings came back with nothing closed | **ESCALATE**. The implementer is not acting on the review, and another round will produce the same paragraph |
+| `flat` | nothing closed, nothing new, no more mutants | **ESCALATE**. The round changed nothing |
+
+`trend.closed`, `trend.repeated` and `trend.new` name the specific mutants, and
+`quality_delta` tracks the reviewer's own grading of the implementer's mutants
+between rounds. Rising quality with new-frontier findings is convergence even
+when the blocking count does not fall - the work is getting better and the
+reviewer is having to dig harder to find anything.
+
+`max_rounds: null` hands the stopping decision entirely to these shapes, bounded
+by `hard_round_cap` (default 8) so a pathological run still terminates. A fixed
+`max_rounds` remains available and simply adds one more escalation trigger.
+
 ## Escalation triggers
 
 Defaults, and all of them are judgement calls you can make earlier:

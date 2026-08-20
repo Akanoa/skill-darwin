@@ -117,10 +117,19 @@ $DARWIN judge --round 1 --record REVISE --reason "M1 and M3 claimed KILLED, both
 ```
 
 - **PASS** - no blocking findings: every claim reproduced, no survivors without
-  a justification you accept, the reviewer's own mutants all died, tests intact.
+  a justification you accept, the reviewer's in-task mutants all died, tests intact.
 - **REVISE** - anything blocking. Write the feedback, then run round N+1 with
   the same implementer worktree (its history is the evidence trail).
 - **ESCALATE** - stop and hand it to a human.
+
+`judgment.json` carries a `trend` over all rounds so far - `converging`,
+`partial`, `recurring`, `flat`, `converged` - naming which findings were closed,
+which came back, and whether the reviewer's grading of the implementer's mutants
+improved. Read it before you decide: a round that is still blocking but closed
+everything from last round is the loop working, while the same finding reported
+twice with nothing closed will not be fixed by asking a third time. With
+`max_rounds: null` the trend is the only thing ending the loop, short of the
+hard cap.
 
 Judge the *evidence*, not the prose. A confident narrative with a fabricated
 kill is worse than a blunt report that admits a survivor. Distinguish an honest

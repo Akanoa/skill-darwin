@@ -60,7 +60,8 @@ EOF
 cat > darwin.config.json <<EOF
 {
   "spawn": "herdr-agent",
-  "max_rounds": 2,
+  "max_rounds": null,
+  "hard_round_cap": 6,
   "test": {
     "command": "python3 -m unittest discover -q -s . -p \"test_*.py\"",
     "single_command": "python3 -m unittest -q {selector}"
@@ -119,7 +120,8 @@ for a in agents:
   cat ".darwin/spawn-$role-r$round.json"
 }
 
-MAX=$(python3 -c "import json;print(json.load(open('darwin.config.json'))['max_rounds'])")
+MAX=$(python3 -c "import json;print(json.load(open('darwin.config.json'))['hard_round_cap'])")
+note "max_rounds is unbounded: the orchestrator stops when the trend says to (hard cap $MAX)"
 FEEDBACK=""
 VERDICT=""
 
@@ -144,9 +146,16 @@ for ROUND in $(seq 1 "$MAX"); do
   python3 -c "
 import json
 d = json.load(open('judgment-r$ROUND.json'))
-print('   verdict:', d['recommendation'])
+t = d.get('trend', {})
+print('   verdict:', d['recommendation'], '  trend:', t.get('shape'))
+for x in t.get('detail', []): print('   trend    -', x[:150])
+print('   closed:', t.get('closed'), ' still open:', t.get('repeated'), ' new:', t.get('new'),
+      ' quality delta:', t.get('quality_delta'))
 for b in d['blocking']: print('   blocking -', b[:150])
-for n in d['notes'][:4]: print('   note     -', n[:150])
+for e in d.get('escalate_reasons', []): print('   ESCALATE -', e[:200])
+for n in d['notes'][:3]: print('   note     -', n[:150])
+print('   per-round:', [(f['round'], f['mutants'], f['kill_rate'], f['strong_ratio'],
+                         len(f['in_task']), len(f['beyond'])) for f in d.get('round_facts', [])])
 "
   VERDICT="$REC"
   [ "$REC" = "PASS" ] && break

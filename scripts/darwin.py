@@ -39,8 +39,10 @@ DEFAULT_CONFIG = {
     "accept_startup_prompt": True,  # answer a CLI's own "do you trust this folder?"
                                     # prompt for the worktree darwin created
     "bus": "auto",                # auto | herdr | file
-    "max_rounds": 3,
+    "max_rounds": 3,              # null = let the trend decide, up to hard_round_cap
+    "hard_round_cap": 8,
     "escalate_after_fabrications": 2,
+    "stall_rounds": 2,            # rounds of no net progress before escalating
     "worktree_root": ".darwin/worktrees",
     "branch_prefix": "darwin",
     "test": {
@@ -1295,6 +1297,91 @@ def cmd_ui(args):
 # judgment
 # --------------------------------------------------------------------------
 
+def fingerprint(text: str, keep: int = 64) -> str:
+    """Collapse a finding to something comparable across rounds."""
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()[:keep]
+
+
+def round_facts(ctx: Ctx, rnd: int) -> dict:
+    rep = read_json(ctx.round_dir(rnd, "implementer") / "MUTATION-REPORT.json", default={})
+    ver = read_json(ctx.round_dir(rnd, "implementer") / "verify.orchestrator.json", default={})
+    rev = read_json(ctx.round_dir(rnd, "reviewer") / "REVIEW.json", default={})
+    surv = [a for a in (rev.get("adversarial_mutants") or [])
+            if (a.get("observed") or {}).get("status") == "SURVIVED"]
+    in_task = [a for a in surv if (a.get("scope") or "in-task") == "in-task"]
+    grades = [m.get("quality") for m in (rev.get("mutant_findings") or [])]
+    strong = sum(1 for g in grades if g == "strong")
+    return {
+        "round": rnd,
+        "mutants": (rep.get("summary") or {}).get("total", 0),
+        "kill_rate": (ver.get("summary") or {}).get("kill_rate", 0.0),
+        "fabrications": (ver.get("summary") or {}).get("fabricated_kills") or [],
+        "blocking_guards": (ver.get("summary") or {}).get("blocking_guards") or [],
+        "verdict": (rev.get("verdict") or "").upper(),
+        "in_task": {fingerprint(a.get("intent")): a.get("id") for a in in_task},
+        "beyond": {fingerprint(a.get("intent")): a.get("id") for a in surv if a not in in_task},
+        "gaps": sorted({fingerprint(g) for g in (rev.get("coverage_gaps") or [])}),
+        "strong_ratio": round(strong / len(grades), 2) if grades else None,
+    }
+
+
+def analyse_trend(rounds: list) -> dict:
+    """What the sequence of rounds says, as opposed to the latest one.
+
+    Three shapes matter. Findings that keep coming back mean the implementer is
+    not acting on them. Findings that get closed while new ones appear mean the
+    loop is working. Findings that are all out of scope mean the reviewer has run
+    out of task and is now designing features.
+    """
+    if not rounds:
+        return {"shape": "unknown", "detail": []}
+    now = rounds[-1]
+    prev = rounds[-2] if len(rounds) > 1 else None
+    out = {"shape": "first-round", "detail": [], "repeated": [], "closed": [], "new": [],
+           "quality_delta": None, "stalled": 0}
+    if not prev:
+        return out
+
+    repeated = sorted(set(now["in_task"]) & set(prev["in_task"]))
+    closed = sorted(set(prev["in_task"]) - set(now["in_task"]))
+    fresh = sorted(set(now["in_task"]) - set(prev["in_task"]))
+    out["repeated"] = [now["in_task"][k] for k in repeated]
+    out["closed"] = [prev["in_task"][k] for k in closed]
+    out["new"] = [now["in_task"][k] for k in fresh]
+    if now["strong_ratio"] is not None and prev["strong_ratio"] is not None:
+        out["quality_delta"] = round(now["strong_ratio"] - prev["strong_ratio"], 2)
+
+    gaps_repeated = sorted(set(now["gaps"]) & set(prev["gaps"]))
+    progressed = bool(closed) or now["mutants"] > prev["mutants"] or (out["quality_delta"] or 0) > 0
+
+    stalled = 0
+    for a, b in zip(rounds[1:], rounds[:-1]):
+        same = set(a["in_task"]) & set(b["in_task"])
+        moved = (set(b["in_task"]) - set(a["in_task"])) or a["mutants"] > b["mutants"]
+        stalled = stalled + 1 if (same and not moved) else 0
+    out["stalled"] = stalled
+
+    if not now["in_task"] and not now["blocking_guards"] and not now["fabrications"]:
+        out["shape"] = "converged"
+        if now["beyond"]:
+            out["detail"].append(f"remaining survivors are all beyond the task: {sorted(now['beyond'].values())}")
+    elif repeated and not progressed:
+        out["shape"] = "recurring"
+        out["detail"].append(f"the same findings came back untouched: {out['repeated']}")
+    elif repeated and progressed:
+        out["shape"] = "partial"
+        out["detail"].append(f"closed {out['closed']}, but {out['repeated']} is still open")
+    elif progressed:
+        out["shape"] = "converging"
+        out["detail"].append(f"closed {out['closed']}; the reviewer moved on to {out['new']}")
+    else:
+        out["shape"] = "flat"
+        out["detail"].append("nothing closed and nothing new - the round changed nothing")
+    if gaps_repeated:
+        out["detail"].append(f"{len(gaps_repeated)} coverage gap(s) reported in consecutive rounds")
+    return out
+
+
 def cmd_judge(args):
     ctx = ctx_for(args)
     rnd = args.round or ctx.state["round"] or 1
@@ -1353,13 +1440,25 @@ def cmd_judge(args):
     fabrication_rounds = sum(1 for h in history if h.get("fabrications")) + (1 if osum.get("fabricated_kills") else 0)
     disagreement_rounds = sum(1 for h in history if h.get("disagreements")) + (1 if disagreements else 0)
 
+    facts = [round_facts(ctx, n) for n in range(1, rnd + 1)]
+    trend = analyse_trend([f for f in facts if f["mutants"] or f["verdict"]])
+
     escalate_reasons = []
     if fabrication_rounds >= int(ctx.cfg["escalate_after_fabrications"]):
         escalate_reasons.append(f"{fabrication_rounds} rounds contained fabricated results")
-    if rnd >= int(ctx.cfg["max_rounds"]) and blocking:
-        escalate_reasons.append(f"round {rnd} of {ctx.cfg['max_rounds']} still blocking")
+    cap = ctx.cfg.get("max_rounds")
+    if cap and rnd >= int(cap) and blocking:
+        escalate_reasons.append(f"round {rnd} of {cap} still blocking")
+    if rnd >= int(ctx.cfg.get("hard_round_cap") or 8) and blocking:
+        escalate_reasons.append(f"hard cap of {ctx.cfg.get('hard_round_cap')} rounds reached")
     if disagreement_rounds >= 2:
         escalate_reasons.append("two rounds where independent verifications disagreed - suite is likely non-deterministic")
+    if trend["shape"] == "recurring":
+        escalate_reasons.append("the same findings are being reported round after round with nothing "
+                                "closed - the implementer is not acting on the review: "
+                                + "; ".join(trend["detail"]))
+    if trend.get("stalled", 0) >= int(ctx.cfg.get("stall_rounds") or 2):
+        escalate_reasons.append(f"{trend['stalled']} consecutive rounds with no net progress")
 
     if escalate_reasons:
         recommendation = "ESCALATE"
@@ -1372,6 +1471,7 @@ def cmd_judge(args):
         "run_id": ctx.run_id, "round": rnd, "judged_at": now(),
         "recommendation": recommendation,
         "blocking": blocking, "notes": reasons, "escalate_reasons": escalate_reasons,
+        "trend": trend, "round_facts": facts,
         "facts": {
             "implementer_summary": report.get("summary"),
             "orchestrator_verification": osum,
