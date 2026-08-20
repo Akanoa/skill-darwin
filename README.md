@@ -23,6 +23,11 @@ orchestrator ──spawn──> implementer  (own worktree: red → green → mu
       └── judge: PASS / REVISE (another round) / ESCALATE (human review)
 ```
 
+**[WORKFLOW.md](WORKFLOW.md) is a real run on the record** — two rounds, both
+agents' output, every number reproduced from the artefacts, ending in a PASS the
+orchestrator decided on. Read that first if you want to know what this actually
+does.
+
 ## Why mutation, and not coverage
 
 Coverage says a line ran. It does not say anyone would notice if that line were
