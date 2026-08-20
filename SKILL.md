@@ -51,6 +51,18 @@ $DARWIN worktree add --role implementer     # branches from the base commit
 `.darwin/runs/<run-id>/`. That directory is the run's evidence and survives the
 agents.
 
+If the user is watching in herdr, give the run a face before you spawn anything:
+
+```bash
+$DARWIN ui        # a `darwin-run` workspace whose pane renders the live board
+$DARWIN watch --once   # or the same board, once, right here
+```
+
+The orchestrator is wherever the skill was invoked, which is usually outside
+herdr — so the roles would otherwise be the only visible thing. (When you *are*
+running inside a herdr pane, darwin registers it as `darwin-orchestrator` and
+reports your state as the loop moves.)
+
 ### 2. Implementer round
 ```bash
 $DARWIN spawn --role implementer --round 1                 # first round
@@ -87,6 +99,10 @@ implementer avoided, audits the tests and the git history, and writes
 
 Use a **different provider or model** from the implementer when you can. Two
 instances of the same model share the same blind spots.
+
+With herdr, set `"spawn": "herdr-agent"` to run each role as a live, attachable
+session in its own workspace instead of a headless command - useful when the
+user wants to watch, or to step in. `references/providers.md` covers the modes.
 
 ### 5. Judge
 ```bash

@@ -94,6 +94,23 @@ RD="$WORK/.darwin/runs/$RUN/rounds/r1"
 [ "$(jget "$RD/implementer/MUTATION-REPORT.json" "d['summary']['claimed_killed']")" = "2" ] \
   && ok "both mutants measured as killed" || fail "report build"
 
+echo "== an unauthored report is caught"
+$DARWIN verify --role implementer --round 1 --verifier skeleton >/dev/null
+[ "$(jget "$RD/implementer/verify.skeleton.json" "'G_REPORT_INCOMPLETE' in d['summary']['blocking_guards']")" = "True" ] \
+  && ok "the generated skeleton alone is rejected as unauthored" || fail "G_REPORT_INCOMPLETE"
+python3 - "$RD/implementer/MUTATION-REPORT.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["tests_added"] = [{"file": "tests/test_cart.py", "name": "test_rejects_discount_of_one",
+                     "covers": "discount == 1 is rejected"},
+                    {"file": "tests/test_cart.py", "name": "test_missing_qty_counts_as_one",
+                     "covers": "a missing qty counts as 1"}]
+d["red_evidence"] = [{"behaviour": "discount bounds and default qty", "test": "test_rejects_discount_of_one",
+                      "exit_code": 1, "excerpt": "ValueError not raised"}]
+d["narrative"] = "M1 probes the upper bound, M2 the qty default; each dies against its named test."
+json.dump(d, open(p, "w"), indent=2)
+EOF
+
 echo "== dishonest round is caught"
 python3 - "$RD/implementer/MUTATION-REPORT.json" <<'EOF'
 import json, sys

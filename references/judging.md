@@ -21,6 +21,8 @@ Guards come out of `verify`. `block` guards make the round `REVISE` on their own
 | `G_MUTANT_MISSING` | block | a mutant in the report has no patch file |
 | `G_MUTANT_TOUCHES_TESTS` | block | a mutant edits tests instead of production code |
 | `G_MUTANT_NOT_APPLICABLE` | block | a patch no longer applies — it was measured against different code |
+| `G_REPORT_INCOMPLETE` | block | the report is the generated skeleton, unauthored: no `tests_added`, or the `TODO` narrative still in place |
+| `G_REPORT_NO_RED_EVIDENCE` | warn | no `red_evidence` recorded, so nothing shows the tests preceded the code |
 | `G_NAMED_KILLER_MISS` | block | the tests named as killers do not fail on that mutant; something else turned the suite red |
 | `G_TOO_FEW_MUTANTS` | block | below `mutation.min_mutants` |
 | `G_SURVIVORS` | block | a mutant survived with no equivalence justification |

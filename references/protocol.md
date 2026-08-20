@@ -91,6 +91,8 @@ Message: `{seq, ts, from, to, type, round, body}`. Types in use: `assignment`,
 | `report build --role R [--baseline]` | assemble the measured report skeleton |
 | `verify --role R [--report P] --verifier NAME` | replay every mutant, diff against the claims |
 | `judge --round N [--record VERDICT --reason ...]` | merge the evidence into a verdict |
+| `watch [--once] [--follow]` | live status board: roles, herdr state, per-round evidence, bus tail |
+| `ui` | open a `darwin-run` herdr workspace whose pane renders that board |
 | `escalate --reason ...` | write ESCALATION.md, notify, mark the run escalated |
 | `land --strategy patch\|merge` | export or merge the accepted branch |
 | `clean [--delete-branches] [--purge]` | remove worktrees; `--purge` also deletes the evidence |

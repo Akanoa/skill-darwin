@@ -35,7 +35,9 @@ TAIL = 8000
 
 DEFAULT_CONFIG = {
     "isolation": "auto",          # auto | herdr | git | none
-    "spawn": "auto",              # auto | herdr | subprocess
+    "spawn": "auto",              # auto | herdr-agent | herdr | subprocess
+    "accept_startup_prompt": True,  # answer a CLI's own "do you trust this folder?"
+                                    # prompt for the worktree darwin created
     "bus": "auto",                # auto | herdr | file
     "max_rounds": 3,
     "escalate_after_fabrications": 2,
@@ -76,19 +78,27 @@ DEFAULT_CONFIG = {
 }
 
 PROVIDERS = {
-    # Best-effort headless invocations. Override in darwin.config.json when a
-    # CLI changes its flags: agents.<role>.cmd wins over everything here.
+    # Best-effort invocations. `args` runs the CLI headless; `interactive_args`
+    # is used when the agent is started as a live TUI inside a herdr pane
+    # (spawn: "herdr-agent"). Override in darwin.config.json when a CLI changes
+    # its flags: agents.<role>.cmd wins over everything here.
     "claude": {"bin": "claude", "args": ["-p", "--dangerously-skip-permissions"],
-               "model_args": ["--model", "{model}"], "prompt_mode": "arg"},
+               "model_args": ["--model", "{model}"], "prompt_mode": "arg",
+               "herdr_kind": "claude", "interactive_args": ["--dangerously-skip-permissions"]},
     "codex": {"bin": "codex", "args": ["exec", "--full-auto"],
-              "model_args": ["--model", "{model}"], "prompt_mode": "arg"},
+              "model_args": ["--model", "{model}"], "prompt_mode": "arg",
+              "herdr_kind": "codex", "interactive_args": ["--full-auto"]},
     "gemini": {"bin": "gemini", "args": ["-y", "-p"],
-               "model_args": ["-m", "{model}"], "prompt_mode": "arg"},
+               "model_args": ["-m", "{model}"], "prompt_mode": "arg",
+               "herdr_kind": "gemini", "interactive_args": ["-y"]},
     "opencode": {"bin": "opencode", "args": ["run"],
-                 "model_args": ["-m", "{model}"], "prompt_mode": "arg"},
+                 "model_args": ["-m", "{model}"], "prompt_mode": "arg",
+                 "herdr_kind": "opencode", "interactive_args": []},
     "cursor": {"bin": "cursor-agent", "args": ["-p", "--force"],
-               "model_args": ["--model", "{model}"], "prompt_mode": "arg"},
-    "amp": {"bin": "amp", "args": ["-x"], "model_args": [], "prompt_mode": "arg"},
+               "model_args": ["--model", "{model}"], "prompt_mode": "arg",
+               "herdr_kind": "cursor", "interactive_args": ["--force"]},
+    "amp": {"bin": "amp", "args": ["-x"], "model_args": [], "prompt_mode": "arg",
+            "herdr_kind": "amp", "interactive_args": []},
     "crush": {"bin": "crush", "args": ["run", "-q"],
               "model_args": ["-m", "{model}"], "prompt_mode": "arg"},
 }
@@ -477,10 +487,119 @@ def spawn_mode(ctx: Ctx, role: str) -> str:
     herdr_ok = bool(pane) and herdr_available()
     if mode == "auto":
         return "herdr" if herdr_ok else "subprocess"
-    if mode == "herdr" and not herdr_ok:
-        warn(f"spawn=herdr requested but {role} has no herdr pane - running the agent as a subprocess")
+    if mode in ("herdr", "herdr-agent") and not herdr_ok:
+        warn(f"spawn={mode} requested but {role} has no herdr pane - running the agent as a subprocess")
         return "subprocess"
     return mode
+
+
+def pane_text(pane: str) -> str:
+    """The pane's visible transcript. `pane read` prints terminal text, not JSON."""
+    code, out, _ = run(["herdr", "pane", "read", pane], timeout=60)
+    return out if code == 0 else ""
+
+
+STARTUP_PROMPT_PATTERNS = [
+    r"trust (this|the) folder", r"Yes, I trust", r"Do you trust", r"trust the files",
+]
+
+EXPECTED_ARTIFACT = {"implementer": "MUTATION-REPORT.json", "reviewer": "REVIEW.json"}
+
+
+def herdr_agent_state(name: str):
+    for a in (herdr_json(["agent", "list"]) or {}).get("agents", []):
+        if (a.get("name") or a.get("label")) == name:
+            return a
+    return None
+
+
+def clear_startup_prompt(ctx: Ctx, name: str, pane: str) -> bool:
+    """Answer the agent CLI's own start-up trust prompt, if that is what blocks it.
+
+    The directory in question is a worktree darwin created from the user's own
+    repository, and the run already opted into an unattended agent - so this is
+    a confirmation, not a decision. Set accept_startup_prompt=false to answer it
+    by hand instead (`herdr agent attach darwin-<role>`).
+    """
+    text = pane_text(pane)
+    if not any(re.search(pat, text, re.I) for pat in STARTUP_PROMPT_PATTERNS):
+        return False
+    if not ctx.cfg.get("accept_startup_prompt", True):
+        warn(f"{name} is waiting at a start-up prompt; attach with `herdr agent attach {name}`")
+        return False
+    print(f"darwin: answering {name}'s start-up trust prompt for its own worktree")
+    herdr_json(["agent", "send-keys", name, "Enter"], timeout=30)
+    for _ in range(30):
+        time.sleep(2)
+        state = herdr_agent_state(name)
+        if state and not state.get("launch_pending") and state.get("agent_status") != "blocked":
+            return True
+    return False
+
+
+def spawn_via_herdr_agent(ctx: Ctx, role: str, wt: Path, log: Path, timeout: int) -> tuple:
+    """Start (or reuse) a live agent TUI in the role's herdr pane and prompt it.
+
+    This is the agent-native path: the CLI runs interactively, herdr tracks its
+    state, and the run is watchable and attachable while it happens.
+    """
+    spec = ctx.cfg["agents"][role]
+    tpl = PROVIDERS.get(spec.get("provider") or "", {})
+    kind = spec.get("herdr_kind") or tpl.get("herdr_kind")
+    if not kind:
+        return None, f"[darwin] provider {spec.get('provider')} has no herdr agent kind", 0.0
+    pane = ctx.state["roles"][role]["pane_id"]
+    name = f"darwin-{role}"
+    started = time.monotonic()
+
+    listing = herdr_json(["agent", "list"]) or {}
+    known = {a.get("name") or a.get("label") for a in listing.get("agents", [])}
+    if name not in known:
+        args = list(tpl.get("interactive_args", []))
+        if spec.get("model") and tpl.get("model_args"):
+            args += [a.replace("{model}", spec["model"]) for a in tpl["model_args"]]
+        cmd = ["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", "120000"]
+        if args:
+            cmd += ["--", *args]
+        herdr_json(cmd, timeout=200)
+        state = herdr_agent_state(name)
+        if state and (state.get("launch_pending") or state.get("agent_status") == "blocked"):
+            clear_startup_prompt(ctx, name, pane)
+            state = herdr_agent_state(name)
+        if not state or state.get("agent_status") in (None, "blocked"):
+            return None, f"[darwin] {name} never became ready in pane {pane}", \
+                   round(time.monotonic() - started, 2)
+        ctx.state["roles"][role]["herdr_agent"] = name
+        ctx.save()
+
+    deadline = started + timeout
+    artifact = ctx.round_dir(ctx.state.get("round") or 1, role) / EXPECTED_ARTIFACT.get(role, "")
+    prompt_text, nudges, res = BOOTSTRAP, 0, None
+    while True:
+        left = max(60, int(deadline - time.monotonic()))
+        # herdr distinguishes idle from done; wait for either, or a settled agent
+        # can sit unnoticed until the role's timeout expires
+        res = herdr_json(["agent", "prompt", name, prompt_text, "--wait",
+                          "--until", "idle", "--until", "done",
+                          "--timeout", str(left * 1000)], timeout=left + 120)
+        if res is None or artifact.name == "" or artifact.exists() or nudges >= 2 \
+                or time.monotonic() >= deadline:
+            break
+        # herdr reports the first settled state after submission; an agent that
+        # goes idle without its deliverable simply is not done yet
+        nudges += 1
+        print(f"darwin: {name} is idle but {artifact.name} is missing - nudging ({nudges}/2)")
+        prompt_text = (f"You have not written {artifact} yet. Re-read .darwin/PROMPT.md "
+                       f"and finish the protocol, ending with that file and the msg send.")
+
+    secs = round(time.monotonic() - started, 2)
+    text = pane_text(pane)
+    if text:
+        log.write_text(text, encoding="utf-8")
+    if res is None:
+        herdr_report(ctx, role, "blocked", "darwin: agent did not settle in time")
+        return 124, text or f"[darwin] TIMEOUT waiting for {name} to go idle", secs
+    return 0, text, secs
 
 
 def herdr_report(ctx: Ctx, role: str, state: str, message: str = ""):
@@ -535,7 +654,7 @@ def spawn_agent(ctx: Ctx, role: str, rnd: int, prompt_text: str) -> dict:
     (rdir / "PROMPT.md").write_text(prompt_text, encoding="utf-8")
 
     argv, stdin_text, provider = build_agent_cmd(ctx.cfg, role, BOOTSTRAP)
-    if not have(argv[0]):
+    if not have(argv[0]) and spawn_mode(ctx, role) != "herdr-agent":
         die(f"agent CLI '{argv[0]}' not on PATH (provider={provider}). "
             f"Install it, or set agents.{role}.cmd in darwin.config.json, "
             f"or set provider to 'inline' and drive the agent yourself with `darwin prompt`")
@@ -546,6 +665,11 @@ def spawn_agent(ctx: Ctx, role: str, rnd: int, prompt_text: str) -> dict:
     label = f"{provider}{'/' + spec['model'] if spec.get('model') else ''}"
     print(f"darwin: spawning {role} [{label}] via {mode} in {wt}")
 
+    if mode == "herdr-agent":
+        code, out, secs = spawn_via_herdr_agent(ctx, role, wt, log, timeout)
+        if code is None:
+            warn(f"herdr agent start failed ({out.strip()[:200]}) - falling back to a headless pane run")
+            mode = "herdr"
     if mode == "herdr":
         stdin_file = None
         if stdin_text is not None:
@@ -553,7 +677,7 @@ def spawn_agent(ctx: Ctx, role: str, rnd: int, prompt_text: str) -> dict:
             stdin_file.write_text(stdin_text, encoding="utf-8")
         code, out, secs = spawn_via_herdr(ctx, role, argv, stdin_file, wt, log, timeout)
         if code is None:
-            warn("herdr spawn failed - retrying as a subprocess")
+            warn("herdr pane run failed - retrying as a subprocess")
             mode = "subprocess"
     if mode == "subprocess":
         code, out, secs = run(argv, cwd=wt, timeout=timeout, stdin_text=stdin_text,
@@ -919,6 +1043,13 @@ def collect_guards(ctx: Ctx, wt: Path, report: dict, mutants_dir: Path, verified
         add("G_KILL_RATE", "block",
             f"kill rate {rate:.2f} is below the required {required:.2f} "
             f"({killed_now} of {total} mutants killed)")
+    if not report.get("tests_added"):
+        add("G_REPORT_INCOMPLETE", "block", "the report lists no tests_added - it was not authored, only generated")
+    elif str(report.get("narrative", "")).strip().upper().startswith("TODO"):
+        add("G_REPORT_INCOMPLETE", "block", "the report still carries the generated TODO narrative placeholder")
+    elif not report.get("red_evidence"):
+        add("G_REPORT_NO_RED_EVIDENCE", "warn", "no red_evidence recorded - nothing shows the tests preceded the code")
+
     misses = [v["id"] for v in verified if v.get("targeted_discrepancy") == "named_killer_does_not_kill"]
     if misses:
         add("G_NAMED_KILLER_MISS", "block",
@@ -1026,6 +1157,141 @@ def cmd_verify(args):
 
 
 # --------------------------------------------------------------------------
+# live view
+# --------------------------------------------------------------------------
+
+def register_orchestrator(ctx: Ctx, state: str, message: str = ""):
+    """If the orchestrator itself runs inside a herdr pane, show it as one."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane or not have("herdr"):
+        return
+    args = ["pane", "report-agent", pane, "--source", "darwin",
+            "--agent", "darwin-orchestrator", "--state", state]
+    if message:
+        args += ["--message", message[:200]]
+    herdr_json(args, timeout=30)
+
+
+def board(ctx: Ctx) -> str:
+    """One frame of the run's live status board."""
+    state = read_json(ctx.run_dir / "run.json")
+    cfg = state["config"]
+    agents = {}
+    if have("herdr"):
+        for a in (herdr_json(["agent", "list"], timeout=20) or {}).get("agents", []):
+            agents[a.get("name") or a.get("label")] = a.get("agent_status")
+    out = [f"\033[1mdarwin\033[0m  {state['run_id']}",
+           f"status {state['status']}   round {state['round']}/{cfg['max_rounds']}   "
+           f"base {state['base_commit'][:8]}   {now()}", ""]
+
+    out.append("\033[1mroles\033[0m")
+    for role in ("implementer", "reviewer"):
+        info = state["roles"].get(role)
+        if not info:
+            out.append(f"  {role:12} -")
+            continue
+        spec = cfg["agents"][role]
+        model = f"{spec.get('provider')}/{spec.get('model') or 'default'}"
+        live = agents.get(f"darwin-{role}", "-")
+        out.append(f"  {role:12} {model:22} {info.get('pane_id', '-'):8} {live:8} {info['branch']}")
+    out.append("")
+
+    rounds = sorted((ctx.run_dir / "rounds").glob("r*")) if (ctx.run_dir / "rounds").exists() else []
+    for rdir in rounds:
+        out.append(f"\033[1m{rdir.name}\033[0m")
+        rep = read_json(rdir / "implementer" / "MUTATION-REPORT.json", default={})
+        if rep:
+            sm = rep.get("summary", {})
+            out.append(f"  report        {sm.get('total', 0)} mutants, {sm.get('claimed_killed', 0)} claimed killed")
+        for verifier in ("orchestrator", "reviewer"):
+            for where in (rdir / "implementer", rdir / "reviewer"):
+                v = read_json(where / f"verify.{verifier}.json", default={})
+                if not v:
+                    continue
+                vs = v["summary"]
+                flags = []
+                if vs.get("fabricated_kills"):
+                    flags.append(f"FABRICATED {vs['fabricated_kills']}")
+                if vs.get("named_killer_misses"):
+                    flags.append(f"killer-miss {vs['named_killer_misses']}")
+                if vs.get("blocking_guards"):
+                    flags.append(",".join(vs["blocking_guards"]))
+                out.append(f"  verify/{verifier:<11} {vs['killed']}/{vs['total']} killed"
+                           + (f"   \033[31m{' | '.join(flags)}\033[0m" if flags else "   clean"))
+                break
+        rev = read_json(rdir / "reviewer" / "REVIEW.json", default={})
+        if rev:
+            adv = rev.get("adversarial_mutants") or []
+            survived = [a.get("id") for a in adv if (a.get("observed") or {}).get("status") == "SURVIVED"]
+            out.append(f"  review        {rev.get('verdict')}   {len(adv)} adversarial, "
+                       f"{len(survived)} survived   {len(rev.get('dishonesty_findings') or [])} dishonesty findings")
+        jud = read_json(rdir / "judgment.json", default={})
+        if jud:
+            out.append(f"  judgment      {jud.get('recommendation')}"
+                       + (f" (recorded {jud['recorded_verdict']})" if jud.get("recorded_verdict") else "")
+                       + f"   {len(jud.get('blocking') or [])} blocking")
+        out.append("")
+
+    msgs = bus_read(ctx)[-6:]
+    if msgs:
+        out.append("\033[1mbus\033[0m")
+        for m in msgs:
+            out.append(f"  #{m['seq']:<3} {m['from']:>12} -> {m['to']:<12} {m['type']}")
+    return "\n".join(out)
+
+
+def cmd_watch(args):
+    ctx = ctx_for(args)
+    if args.once:
+        print(board(ctx))
+        return
+    try:
+        while True:
+            ctx.state = read_json(ctx.run_dir / "run.json")
+            sys.stdout.write("\033[H\033[J" + board(ctx) + "\n")
+            sys.stdout.flush()
+            if ctx.state["status"] in ("passed", "escalated") and not args.follow:
+                return
+            time.sleep(max(1, int(args.interval)))
+    except KeyboardInterrupt:
+        return
+
+
+def cmd_ui(args):
+    """Give the run itself a herdr workspace, so the loop is visible too."""
+    ctx = ctx_for(args)
+    if not herdr_available():
+        warn("herdr is not running - showing the board here instead")
+        args.once, args.follow, args.interval = False, True, 3
+        return cmd_watch(args)
+    cmd = (f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} "
+           f"--cwd {shlex.quote(str(ctx.repo))} watch --run {shlex.quote(ctx.run_id)} --follow")
+    existing = ctx.state.get("ui")
+    if existing and existing.get("pane_id"):
+        herdr_json(["pane", "run", existing["pane_id"], cmd], timeout=60)
+        herdr_json(["workspace", "focus", existing["workspace_id"]], timeout=30)
+        print(json.dumps(existing, indent=2))
+        return
+    res = herdr_json(["workspace", "create", "--cwd", str(ctx.repo),
+                      "--label", f"darwin-run", "--no-focus"], timeout=60)
+    if not res:
+        die("could not create a herdr workspace for the run")
+    ws = (res.get("workspace") or {}).get("workspace_id")
+    pane = (res.get("root_pane") or {}).get("pane_id")
+    herdr_json(["pane", "rename", pane, f"darwin {ctx.run_id}"], timeout=30)
+    herdr_json(["pane", "run", pane, cmd], timeout=60)
+    herdr_json(["pane", "report-agent", pane, "--source", "darwin",
+                "--agent", "darwin-run", "--state", "working",
+                "--message", f"round {ctx.state['round']}"], timeout=30)
+    ctx.state["ui"] = {"workspace_id": ws, "pane_id": pane}
+    ctx.state.setdefault("herdr_aux_workspaces", [])
+    if ws and ws not in ctx.state["herdr_aux_workspaces"]:
+        ctx.state["herdr_aux_workspaces"].append(ws)
+    ctx.save()
+    print(json.dumps(ctx.state["ui"], indent=2))
+
+
+# --------------------------------------------------------------------------
 # judgment
 # --------------------------------------------------------------------------
 
@@ -1110,6 +1376,8 @@ def cmd_judge(args):
         "recorded_reason": args.reason,
     }
     write_json(ctx.round_dir(rnd) / "judgment.json", judgment)
+    register_orchestrator(ctx, "blocked" if recommendation == "ESCALATE" else "idle",
+                          f"round {rnd}: {recommendation}")
 
     if args.record:
         entry = {"round": rnd, "verdict": args.record.upper(), "reason": args.reason,
@@ -1269,6 +1537,7 @@ def cmd_spawn(args):
     prompt = render_prompt(ctx, args.role, rnd, feedback)
     bus_send(ctx, "orchestrator", args.role, "assignment",
              {"round": rnd, "prompt": str(ctx.round_dir(rnd, args.role) / "PROMPT.md")}, rnd)
+    register_orchestrator(ctx, "working", f"spawning {args.role} for round {rnd}")
     result = spawn_agent(ctx, args.role, rnd, prompt)
     bus_send(ctx, args.role, "orchestrator", "agent_exit",
              {k: result[k] for k in ("exit_code", "duration_s", "log")}, rnd)
@@ -1491,6 +1760,17 @@ def build_parser() -> argparse.ArgumentParser:
     j.add_argument("--record", choices=["PASS", "REVISE", "ESCALATE", "pass", "revise", "escalate"],
                    help="record the orchestrator's final verdict for this round")
     j.add_argument("--reason"); j.set_defaults(func=cmd_judge)
+
+    wv = with_run(sub.add_parser("watch", help="live status board for a run"))
+    wv.add_argument("--once", action="store_true", help="print one frame and exit")
+    wv.add_argument("--follow", action="store_true", help="keep refreshing after the run ends")
+    wv.add_argument("--interval", type=int, default=3)
+    wv.set_defaults(func=cmd_watch)
+
+    ui = with_run(sub.add_parser("ui", help="open a herdr workspace that renders the run"))
+    ui.add_argument("--once", action="store_true"); ui.add_argument("--follow", action="store_true")
+    ui.add_argument("--interval", type=int, default=3)
+    ui.set_defaults(func=cmd_ui)
 
     e = with_run(sub.add_parser("escalate", help="stop the loop and write a human-review request"))
     e.add_argument("--round", type=int); e.add_argument("--reason", required=True)
