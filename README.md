@@ -35,6 +35,159 @@ reproducible by anyone, at any later point. That is what turns a report into
 evidence, and what lets an orchestrator tell an honest mistake from a fabricated
 result instead of taking an agent's word for it.
 
+## How it works
+
+### Three roles, and what each one may not do
+
+**The implementer** writes the code. It works alone in its own git worktree and
+never sees the reviewer. Its protocol is fixed: a failing test committed as
+`red:` before the code that satisfies it, committed as `green:`, per behaviour —
+then, for each behaviour, a *mutant*: a small edit to the production code that
+simulates a defect a person could plausibly ship, which its test must catch.
+
+**The reviewer** never writes code, never commits, never pushes. It gets its own
+worktree at the implementer's head, replays every mutation itself, grades whether
+each one proves anything, and then attacks whatever the implementer left alone
+with mutants of its own.
+
+**The orchestrator** writes nothing and reviews nothing. It sets up isolation,
+dispatches the roles, runs the mechanical verification itself, and decides:
+accept, another round, or stop and call a human.
+
+The division of labour is the point. The machine settles what is *reproducible*;
+the reviewer judges what is *meaningful*; the orchestrator weighs the two. None of
+them is asked to grade its own work.
+
+### A round, step by step
+
+```bash
+darwin init --task-file TASK.md          # records the task, config and base commit
+darwin worktree add --role implementer   # isolated checkout on its own branch
+darwin spawn --role implementer --round 1
+```
+
+`spawn` renders `agents/implementer.md` with this run's real paths, writes it to
+`.darwin/PROMPT.md` inside the worktree, and launches the configured agent CLI
+with a one-line bootstrap: *read that file and follow it*. The brief is a file,
+not an argument, which is why any provider works and why length is never a
+problem.
+
+Inside the worktree, the agent drives darwin itself:
+
+```bash
+# edit the production file so the defect exists, then:
+darwin mutant capture --role implementer --id M1 --operator boundary \
+  --intent "upper bound made inclusive" \
+  --expected-killers "tests.test_duration.TestParseDuration.test_hours"
+darwin mutant run --role implementer          # apply, run the suite, revert, record
+darwin report build --role implementer --baseline
+```
+
+`capture` refuses outright if the edit touches a test file — mutants change
+production code, nothing else — stores it as a **patch**, and reverts the tree.
+`run` measures each patch. `report build` assembles the report from those
+measurements, and the agent may only annotate the prose fields around them.
+
+Then the orchestrator checks the claims rather than reading them:
+
+```bash
+darwin verify --role implementer --round 1 --verifier orchestrator
+```
+
+This re-applies every patch, re-runs the suite, and diffs what happened against
+what was claimed:
+
+```json
+{"total": 5, "killed": 5, "kill_rate": 1.0,
+ "claim_mismatches": [], "fabricated_kills": [], "blocking_guards": []}
+```
+
+A `fabricated_kill` is a mutant reported KILLED that survives on replay. There is
+no arguing with it, and no way to talk past it.
+
+```bash
+darwin worktree add --role reviewer      # branches from the implementer's branch
+darwin spawn --role reviewer --round 1
+darwin judge --round 1
+```
+
+The reviewer replays the same patches in its own worktree — two independent
+replays that must agree, or the suite is non-deterministic and every claim built
+on it is unfalsifiable. Then it does the part no script can, and writes
+`REVIEW.json` with `CONFIRM` or `DISPUTE`.
+
+### What is checked mechanically
+
+Not by an agent reading prose. By replaying patches and diffing outcomes:
+
+- every mutant re-applied and re-run, its result compared with the claim
+- the test *named* as the killer run on its own, and required to be the one that
+  fails — "the suite went red somewhere" is not proof
+- the baseline suite green on the unmutated tree
+- tests added, and never deleted, renamed away, skipped, or made trivially true
+- test and build configuration unchanged
+- mutants that touch test files, or no longer apply, rejected
+- the report's `head_commit` matching the worktree, and the worktree clean
+- the report actually authored, not the generated skeleton
+
+Each failure is a guard code (`G_SURVIVORS`, `G_NAMED_KILLER_MISS`,
+`G_TEST_REMOVED`, …) with a severity. Blocking guards end the round on their own.
+
+### What the reviewer judges instead
+
+Everything the guards cannot reach — starting with whether the mutants were worth
+writing. From a real run of the demo, on a task that added a unit-validation
+guard and a numeric bound:
+
+> all four of my adversarial mutants survived, because **every implementer mutant
+> is the inverse of a diff hunk**
+
+That is the failure mode of mutation testing done unsupervised: mutating only what
+you just wrote proves the line is *reached*, not that the *rule* is pinned. The
+implementer's report was honest — 5/5 killed, both replays agreeing, zero
+fabrications, red-before-green confirmed commit by commit — and it was still not
+good enough, because `float()` instead of `int()`, `<= 0` instead of `< 0`, and a
+validator list drifting out of step with its lookup table all sailed through the
+suite untouched.
+
+Nothing mechanical catches that. A second agent, with its own worktree and an
+incentive to attack, does.
+
+The same run makes the opposite point in round two. The implementer adopted all
+four of those mutants, went from 5 to 8, upgraded every `assertRaises` to
+`assertRaisesRegex`, took its test file from 2 to 11 tests — and the reviewer
+graded all eight mutants `strong`, up from two. It also found four *new*
+survivors on a deeper frontier (`5M` accepted by case-folding, `int(x, 0)` making
+`0x10s` mean 16). That is what convergence looks like, and it is also the reason a
+reviewer needs a leash: you can always mutate deeper. Adversarial mutants are
+marked `in-task` or `beyond-task`, and only the first kind blocks a round — the
+second is a feature request wearing a coverage gap's clothes.
+
+### Rounds
+
+A `DISPUTE`, a fabricated claim, a surviving mutant, or any blocking guard makes
+the round `REVISE`. `darwin feedback --round N` drafts the brief-back from that
+round's own evidence — each surviving reviewer mutant with the `git apply` line
+that reproduces it, the mutants graded weak and why, the coverage gaps, anything
+reported as dishonesty — and the next round runs in the *same* worktree, because
+the history is part of the evidence.
+
+Rounds are bounded. `darwin escalate` stops the loop and writes `ESCALATION.md`
+when claims were fabricated twice, when `max_rounds` is reached with findings
+still blocking, when two rounds' verifications disagree (a flaky suite cannot be
+reviewed into reliability), or when the two agents turn out to disagree about what
+correct behaviour even is. **Escalation is a success mode.** The failure mode is
+burning rounds on evidence that was never going to converge.
+
+### Why the isolation matters
+
+Each role gets its own worktree on its own branch, so the implementer cannot
+quietly patch what the reviewer found and the reviewer cannot "help". It also
+means the run survives its own orchestrator: state lives in files under
+`.darwin/runs/<run-id>/`, so a killed orchestrator is resumed by re-running the
+step it died in. That is not theoretical — it happened twice while building this,
+and both agents carried on and finished in their panes.
+
 ## Install
 
 ```bash
@@ -114,19 +267,6 @@ flags override the file; `doctor` shows what resolved.
 
 Give the two roles different models. A reviewer that shares the implementer's
 blind spots agrees for the wrong reasons.
-
-## What is checked mechanically
-
-Not by an agent reading prose, but by replaying patches and diffing outcomes:
-
-- every mutant re-applied and re-run, its outcome compared with what was claimed
-  (`fabricated_kill` = claimed killed, actually survives)
-- the named killer test run on its own, and required to be the one that fails
-- the baseline suite green on the unmutated tree
-- tests added, never deleted, renamed away, skipped or made trivially true
-- test and build configuration unchanged
-- mutants that touch test files, or no longer apply, rejected
-- the report's `head_commit` matching the worktree, and the worktree clean
 
 ## Layout
 

@@ -80,7 +80,15 @@ python3 {{DARWIN}} mutant capture --run {{RUN_ID}} --role reviewer --round {{ROU
 # after capturing them all:
 python3 {{DARWIN}} mutant run --run {{RUN_ID}} --role reviewer --round {{ROUND}}
 ```
-Write at least {{REVIEWER_MIN_MUTANTS}} of them. Every one of yours that **survives** is proof the suite
+Write at least {{REVIEWER_MIN_MUTANTS}} of them.
+
+Mark each one's **scope**. A mutant is `in-task` when it breaks behaviour the task
+asked for or that the diff claims to implement; it is `beyond-task` when killing
+it would require a requirement nobody stated. You can always mutate deeper -
+stricter parsing, tighter bounds, a rule the task never mentioned - and an
+unbounded hunt for survivors never terminates. `beyond-task` findings are worth
+reporting as feature requests; they do not block the round, and dressing one up
+as a coverage gap wastes a round on work nobody asked for. Every one of yours that **survives** is proof the suite
 misses a real defect, and it blocks the round. Same rules as the implementer:
 production code only, plausible defects only.
 

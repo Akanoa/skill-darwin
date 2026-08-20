@@ -73,7 +73,14 @@ Defaults, and all of them are judgement calls you can make earlier:
 5. **The task is underspecified.** If implementer and reviewer disagree about
    what correct behaviour *is*, that is a question for the person who asked, not
    another round.
-6. **The mutation set keeps missing the point.** Rising kill rates on mutants
+6. **The reviewer has moved past the task.** An adversarial reviewer can always
+   find another survivor - parse stricter, bound tighter, invent a rule the task
+   never stated. Survivors marked `beyond-task` do not block; if the remaining
+   findings are all of that kind, the round is a PASS with feature requests
+   attached, not a failure. Watch for this from round two on: rising mutant
+   quality plus new-frontier survivors is convergence, not deadlock, and the
+   right response may be one more round or a wider `max_rounds`, not a stop.
+7. **The mutation set keeps missing the point.** Rising kill rates on mutants
    that avoid the behaviour under test means the loop is being satisfied instead
    of the requirement.
 

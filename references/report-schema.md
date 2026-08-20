@@ -123,6 +123,7 @@ Written by the reviewer. Prose and judgement, backed by ids and paths.
     { "id": "RM1", "target_file": "src/slug.py", "operator": "boundary",
       "intent": "truncation uses max_len + 1",
       "observed": { "exit_code": 0, "status": "SURVIVED" },
+      "scope": "in-task",          // in-task blocks the round; beyond-task is a feature request
       "significance": "an off-by-one in truncation ships unnoticed" }
   ],
   "coverage_gaps": ["nothing pins the leading-dash trim after truncation"],

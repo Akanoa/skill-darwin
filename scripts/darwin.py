@@ -1335,9 +1335,17 @@ def cmd_judge(args):
         blocking.append(f"reviewer dishonesty finding [{f.get('kind')}]: {str(f.get('evidence'))[:300]}")
     adv_survivors = [a for a in (review.get("adversarial_mutants") or [])
                      if (a.get("observed") or {}).get("status") == "SURVIVED"]
-    if adv_survivors:
+    # a mutant can always be made deeper; only the ones aimed at behaviour the task
+    # actually asked for are evidence of a gap rather than a feature request
+    in_task = [a for a in adv_survivors if (a.get("scope") or "in-task") == "in-task"]
+    beyond = [a for a in adv_survivors if a not in in_task]
+    if in_task:
         blocking.append("reviewer's adversarial mutants survived (tests miss real defects): "
-                        + ", ".join(f"{a.get('id')}:{a.get('intent', '')[:60]}" for a in adv_survivors))
+                        + ", ".join(f"{a.get('id')}:{a.get('intent', '')[:60]}" for a in in_task))
+    if beyond:
+        reasons.append("survived, but the reviewer marked them beyond the task's scope - "
+                       "these are feature requests, not coverage gaps: "
+                       + ", ".join(f"{a.get('id')}:{a.get('intent', '')[:60]}" for a in beyond))
     for gap in review.get("coverage_gaps", []) or []:
         reasons.append(f"coverage gap: {str(gap)[:200]}")
 
@@ -1371,6 +1379,8 @@ def cmd_judge(args):
             "reviewer_verdict": verdict_of_review or None,
             "verifier_disagreements": disagreements,
             "adversarial_survivors": [a.get("id") for a in adv_survivors],
+            "adversarial_survivors_in_task": [a.get("id") for a in in_task],
+            "adversarial_survivors_beyond_task": [a.get("id") for a in beyond],
         },
         "recorded_verdict": args.record.upper() if args.record else None,
         "recorded_reason": args.reason,
